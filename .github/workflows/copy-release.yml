@@ -60,16 +60,6 @@ on:
         type: boolean
         default: false
 
-      release_update_mode:
-        description: "Release 更新方式：完整覆盖、保留已有附件、仅更新版本信息"
-        required: true
-        type: choice
-        default: keep_existing_assets
-        options:
-          - overwrite_all_assets
-          - keep_existing_assets
-          - metadata_only
-
       run_copy_docker:
         description: "直接搬运一个或多个 Docker 多架构镜像"
         required: true
@@ -145,6 +135,16 @@ on:
         type: string
         default: ""
 
+      release_update_mode:
+        description: "Release 更新方式：完整覆盖、保留已有附件、仅更新版本信息"
+        required: true
+        type: choice
+        default: keep_existing_assets
+        options:
+          - overwrite_all_assets
+          - keep_existing_assets
+          - metadata_only
+
       include_drafts:
         description: "包含草稿 Release"
         required: true
@@ -194,7 +194,7 @@ jobs:
       selected_json: ${{ steps.final.outputs.selected_json }}
       selected_count: ${{ steps.final.outputs.selected_count }}
     env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_TOKEN: ${{ secrets.WORKFLOW_PAT || secrets.GITHUB_TOKEN }}
       INPUT_SRC_REPO: ${{ inputs.src_repo }}
       TARGET_REPO: ${{ github.repository }}
       COPY_MODE: ${{ inputs.copy_mode }}
@@ -277,7 +277,8 @@ jobs:
           REQUESTED="${RUNNER_TEMP}/requested-tags.txt"
 
           gh release list --repo "${SOURCE_REPO}" --limit 1000 --order asc \
-            --json tagName,name,publishedAt,createdAt,isDraft,isPrerelease > "${ALL}"
+            --json tagName,name,publishedAt,createdAt,isDraft,isPrerelease |
+            jq 'sort_by([(.publishedAt // .createdAt), .tagName])' > "${ALL}"
 
           TOTAL="$(jq length "${ALL}")"
           [ "${TOTAL}" -gt 0 ] || { echo "::error::源仓库没有 Release"; exit 1; }
@@ -333,6 +334,9 @@ jobs:
             mv "${OUT}.tmp" "${OUT}"
           fi
 
+          jq 'sort_by([(.publishedAt // .createdAt), .tagName])' "${OUT}" > "${OUT}.tmp"
+          mv "${OUT}.tmp" "${OUT}"
+
           COUNT="$(jq length "${OUT}")"
           [ "${COUNT}" -gt 0 ] || { echo "::error::没有选中版本"; exit 1; }
           jq -r '.[]|"版本：\(.tagName) | 日期：\(.publishedAt//.createdAt)"' "${OUT}"
@@ -382,6 +386,7 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       TOKEN: ${{ secrets.WORKFLOW_PAT }}
+      GH_TOKEN: ${{ secrets.WORKFLOW_PAT }}
       SOURCE_REPO: ${{ needs.prepare.outputs.src_repo }}
       TARGET_REPO: ${{ needs.prepare.outputs.target_repo }}
       SELECTED_JSON: ${{ needs.prepare.outputs.selected_json }}
@@ -490,6 +495,7 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_TOKEN: ${{ secrets.WORKFLOW_PAT || secrets.GITHUB_TOKEN }}
       SOURCE_REPO: ${{ needs.prepare.outputs.src_repo }}
       TARGET_REPO: ${{ needs.prepare.outputs.target_repo }}
       SELECTED_JSON: ${{ needs.prepare.outputs.selected_json }}
@@ -526,10 +532,29 @@ jobs:
             echo "创建清理快照：${tag}"
             echo "=========================================="
 
+            FORCE_UPDATE=false
+            TARGET_TAG_EXISTS=false
             if git ls-remote --exit-code --tags --refs "${TARGET_URL}" "refs/tags/${tag}" >/dev/null 2>&1; then
-              echo "目标 Tag 已存在，跳过：${tag}"
-              SKIP=$((SKIP+1))
-              continue
+              TARGET_TAG_EXISTS=true
+              if [ "${{ inputs.sync_scope }}" = selected ]; then
+                echo "目标 Tag 已存在，但 selected/range 明确要求处理，将重新生成并比较：${tag}"
+                FORCE_UPDATE=true
+              else
+                EXISTING_REPO="$(mktemp -d)"
+                git -C "${EXISTING_REPO}" init -q
+                git -C "${EXISTING_REPO}" fetch --quiet --depth 1 "${TARGET_URL}" "refs/tags/${tag}:refs/tags/existing-${tag}"
+                EXISTING_COMMIT="$(git -C "${EXISTING_REPO}" rev-list -n 1 "refs/tags/existing-${tag}")"
+                EXISTING_SUBJECT="$(git -C "${EXISTING_REPO}" show -s --format='%s' "${EXISTING_COMMIT}")"
+                rm -rf "${EXISTING_REPO}"
+                if [[ "${EXISTING_SUBJECT}" == Clean\ snapshot\ of* ]]; then
+                  echo "检测到旧 Clean snapshot Tag，将自动重建：${tag}"
+                  FORCE_UPDATE=true
+                else
+                  echo "目标 Tag 已存在且不是旧 Clean snapshot，all_missing 模式安全跳过：${tag}"
+                  SKIP=$((SKIP+1))
+                  continue
+                fi
+              fi
             fi
 
             SNAPSHOT="$(mktemp -d)"
@@ -564,13 +589,25 @@ jobs:
             git -C "${REPO}" add -A
             TREE_ID="$(git -C "${REPO}" write-tree)"
 
-            COMMIT_ID="$(printf 'Clean snapshot of %s from %s\n\nRemoved paths: %s\n' "${tag}" "${SOURCE_REPO}" "${REMOVE_PATHS}" | git -C "${REPO}" commit-tree "${TREE_ID}")"
+            git -C "${CONTROL}" fetch --force --depth 1 upstream "refs/tags/${tag}:refs/tags/source-${tag}"
+            SOURCE_COMMIT="$(git -C "${CONTROL}" rev-list -n 1 "refs/tags/source-${tag}")"
+            SOURCE_AUTHOR_NAME="$(git -C "${CONTROL}" show -s --format='%an' "${SOURCE_COMMIT}")"
+            SOURCE_AUTHOR_EMAIL="$(git -C "${CONTROL}" show -s --format='%ae' "${SOURCE_COMMIT}")"
+            SOURCE_AUTHOR_DATE="$(git -C "${CONTROL}" show -s --format='%aI' "${SOURCE_COMMIT}")"
+            SOURCE_COMMITTER_NAME="$(git -C "${CONTROL}" show -s --format='%cn' "${SOURCE_COMMIT}")"
+            SOURCE_COMMITTER_EMAIL="$(git -C "${CONTROL}" show -s --format='%ce' "${SOURCE_COMMIT}")"
+            SOURCE_COMMITTER_DATE="$(git -C "${CONTROL}" show -s --format='%cI' "${SOURCE_COMMIT}")"
+            git -C "${CONTROL}" show -s --format='%B' "${SOURCE_COMMIT}" > "${REPO}/source-commit-message.txt"
+            COMMIT_ID="$(GIT_AUTHOR_NAME="${SOURCE_AUTHOR_NAME}" GIT_AUTHOR_EMAIL="${SOURCE_AUTHOR_EMAIL}" GIT_AUTHOR_DATE="${SOURCE_AUTHOR_DATE}" GIT_COMMITTER_NAME="${SOURCE_COMMITTER_NAME}" GIT_COMMITTER_EMAIL="${SOURCE_COMMITTER_EMAIL}" GIT_COMMITTER_DATE="${SOURCE_COMMITTER_DATE}" git -C "${REPO}" commit-tree "${TREE_ID}" < "${REPO}/source-commit-message.txt")"
+            rm -f "${REPO}/source-commit-message.txt"
             git -C "${REPO}" update-ref "refs/tags/${tag}" "${COMMIT_ID}"
 
             echo "新根提交：${COMMIT_ID}"
             echo "该提交没有上游父提交，因此不会把作者 workflow 历史带入目标 Tag。"
 
-            if git -C "${REPO}" push "${TARGET_URL}" "refs/tags/${tag}:refs/tags/${tag}"; then
+            PUSH_ARGS=("${TARGET_URL}" "refs/tags/${tag}:refs/tags/${tag}")
+            [ "${FORCE_UPDATE}" = true ] && PUSH_ARGS=(--force "${PUSH_ARGS[@]}")
+            if git -C "${REPO}" push "${PUSH_ARGS[@]}"; then
               OK=$((OK+1))
             else
               echo "::warning::推送清理 Tag 失败：${tag}"
@@ -589,12 +626,14 @@ jobs:
     if: ${{ inputs.run_copy_release }}
     runs-on: ubuntu-24.04
     env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_TOKEN: ${{ secrets.WORKFLOW_PAT || secrets.GITHUB_TOKEN }}
       SOURCE_REPO: ${{ needs.prepare.outputs.src_repo }}
       TARGET_REPO: ${{ needs.prepare.outputs.target_repo }}
       SELECTED_JSON: ${{ needs.prepare.outputs.selected_json }}
       SELECTED_COUNT: ${{ needs.prepare.outputs.selected_count }}
       RELEASE_UPDATE_MODE: ${{ inputs.release_update_mode }}
+      CLEAN_REMOVE_PATHS: ${{ inputs.clean_remove_paths }}
+      CLEAN_PUSH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - name: 搬运标题、说明、状态和附件
         shell: bash
@@ -602,11 +641,54 @@ jobs:
           set -euo pipefail
           SELECTED="${RUNNER_TEMP}/selected.json"
           FAILED_FILE="${RUNNER_TEMP}/failed-releases.txt"
-          printf '%s' "${SELECTED_JSON}" > "${SELECTED}"
+          printf '%s' "${SELECTED_JSON}" | jq 'sort_by([(.publishedAt // .createdAt), .tagName])' > "${SELECTED}"
+          echo "Release 重新整理后的处理顺序："
+          jq -r '.[].tagName' "${SELECTED}" | nl -ba
           : > "${FAILED_FILE}"
           OK=0
           FAIL=0
           CURRENT=0
+
+          repair_legacy_clean_tag_for_release() {
+            local tag="$1"
+            local target_url="https://x-access-token:${CLEAN_PUSH_TOKEN}@github.com/${TARGET_REPO}.git"
+            local source_url="https://github.com/${SOURCE_REPO}.git"
+            local check_dir source_dir new_repo existing_commit existing_subject source_commit tree_id commit_id
+
+            if ! git ls-remote --exit-code --tags --refs "${target_url}" "refs/tags/${tag}" >/dev/null 2>&1; then
+              return 0
+            fi
+
+            check_dir="$(mktemp -d)"
+            git -C "${check_dir}" init -q
+            git -C "${check_dir}" fetch --quiet --depth 1 "${target_url}" "refs/tags/${tag}:refs/tags/existing"
+            existing_commit="$(git -C "${check_dir}" rev-list -n 1 refs/tags/existing)"
+            existing_subject="$(git -C "${check_dir}" show -s --format='%s' "${existing_commit}")"
+
+            if [[ "${existing_subject}" != Clean\ snapshot\ of* ]]; then
+              rm -rf "${check_dir}"
+              return 0
+            fi
+
+            echo "metadata_only 检测到旧 Clean snapshot Tag，自动修复：${tag}"
+            source_dir="$(mktemp -d)"
+            new_repo="$(mktemp -d)"
+            git clone --quiet --depth 1 --branch "${tag}" "${source_url}" "${source_dir}"
+            rm -rf "${source_dir}/.git"
+            for remove_path in ${CLEAN_REMOVE_PATHS}; do rm -rf "${source_dir:?}/${remove_path}"; done
+
+            git -C "${check_dir}" fetch --force --depth 1 "${source_url}" "refs/tags/${tag}:refs/tags/source"
+            source_commit="$(git -C "${check_dir}" rev-list -n 1 refs/tags/source)"
+            git -C "${new_repo}" init -q
+            cp -a "${source_dir}/." "${new_repo}/"
+            git -C "${new_repo}" add -A
+            tree_id="$(git -C "${new_repo}" write-tree)"
+            git -C "${check_dir}" show -s --format='%B' "${source_commit}" > "${new_repo}/message.txt"
+            commit_id="$(GIT_AUTHOR_NAME="$(git -C "${check_dir}" show -s --format='%an' "${source_commit}")" GIT_AUTHOR_EMAIL="$(git -C "${check_dir}" show -s --format='%ae' "${source_commit}")" GIT_AUTHOR_DATE="$(git -C "${check_dir}" show -s --format='%aI' "${source_commit}")" GIT_COMMITTER_NAME="$(git -C "${check_dir}" show -s --format='%cn' "${source_commit}")" GIT_COMMITTER_EMAIL="$(git -C "${check_dir}" show -s --format='%ce' "${source_commit}")" GIT_COMMITTER_DATE="$(git -C "${check_dir}" show -s --format='%cI' "${source_commit}")" git -C "${new_repo}" commit-tree "${tree_id}" < "${new_repo}/message.txt")"
+            git -C "${new_repo}" update-ref "refs/tags/${tag}" "${commit_id}"
+            git -C "${new_repo}" push --force "${target_url}" "refs/tags/${tag}:refs/tags/${tag}"
+            rm -rf "${check_dir}" "${source_dir}" "${new_repo}"
+          }
           while IFS= read -r tag; do
             [ -n "${tag}" ] || continue
             CURRENT=$((CURRENT+1))
@@ -620,45 +702,23 @@ jobs:
             jq -r '.body//""' "${WORK}/info.json" > "${WORK}/body.md"
             DRAFT="$(jq -r .isDraft "${WORK}/info.json")"
             PRE="$(jq -r .isPrerelease "${WORK}/info.json")"
-            TARGET_RELEASE_EXISTS=false
-            if gh release view "${tag}" --repo "${TARGET_REPO}" >/dev/null 2>&1; then
-              TARGET_RELEASE_EXISTS=true
-            fi
-
-            # metadata_only 只更新 Release 版本信息，不下载、删除或上传任何附件。
             if [ "${RELEASE_UPDATE_MODE}" = metadata_only ]; then
+              repair_legacy_clean_tag_for_release "${tag}"
               echo "仅更新版本信息，不处理附件：${tag}"
             else
               gh release download "${tag}" --repo "${SOURCE_REPO}" --dir "${WORK}/assets" || true
             fi
 
-            # 完整覆盖模式通过重建 Release 清除旧附件及幽灵附件索引，Git Tag 保持不变。
+            TARGET_RELEASE_EXISTS=false
+            gh release view "${tag}" --repo "${TARGET_REPO}" >/dev/null 2>&1 && TARGET_RELEASE_EXISTS=true
             if [ "${TARGET_RELEASE_EXISTS}" = true ] && [ "${RELEASE_UPDATE_MODE}" = overwrite_all_assets ]; then
-              echo "完整覆盖附件，删除目标 Release 后重建：${tag}"
-              if ! gh release delete "${tag}" --repo "${TARGET_REPO}" --yes; then
-                echo "${tag}" >> "${FAILED_FILE}"
-                FAIL=$((FAIL+1))
-                rm -rf "${WORK}"
-                continue
-              fi
+              gh release delete "${tag}" --repo "${TARGET_REPO}" --yes
               TARGET_RELEASE_EXISTS=false
-              DELETE_CONFIRMED=false
               for wait_round in 1 2 3 4 5 6; do
-                if ! gh release view "${tag}" --repo "${TARGET_REPO}" >/dev/null 2>&1; then
-                  DELETE_CONFIRMED=true
-                  break
-                fi
-                echo "等待目标 Release 删除生效，第 ${wait_round}/6 次检查..."
+                ! gh release view "${tag}" --repo "${TARGET_REPO}" >/dev/null 2>&1 && break
                 sleep 3
               done
-              if [ "${DELETE_CONFIRMED}" != true ]; then
-                echo "${tag}" >> "${FAILED_FILE}"
-                FAIL=$((FAIL+1))
-                rm -rf "${WORK}"
-                continue
-              fi
             fi
-
             if [ "${TARGET_RELEASE_EXISTS}" = true ]; then
               ARGS=(release edit "${tag}" --repo "${TARGET_REPO}" --title "${TITLE}" --notes-file "${WORK}/body.md" --draft="${DRAFT}" --prerelease="${PRE}")
             else
@@ -667,69 +727,30 @@ jobs:
               [ "${DRAFT}" = true ] && ARGS+=(--draft)
               [ "${PRE}" = true ] && ARGS+=(--prerelease)
             fi
-
             if gh "${ARGS[@]}"; then
               ASSET_FAILURES=0
-              ASSET_SKIPPED=0
-              ASSET_UPLOADED=0
-
               if [ "${RELEASE_UPDATE_MODE}" = metadata_only ]; then
-                echo "Release ${tag} 已更新版本信息，附件未读取、未删除、未上传。"
+                echo "Release ${tag} 已更新版本信息，并已检查旧 Clean snapshot Tag；附件未读取、未删除、未上传。"
               else
                 mapfile -d '' ASSETS < <(find "${WORK}/assets" -maxdepth 1 -type f -print0)
-                TARGET_ASSET_NAMES="${WORK}/target-asset-names.txt"
-                : > "${TARGET_ASSET_NAMES}"
-
-                if [ "${RELEASE_UPDATE_MODE}" = keep_existing_assets ]; then
-                  if gh api "repos/${TARGET_REPO}/releases/tags/${tag}" > "${WORK}/target-release.json"; then
-                    jq -r '.assets[]?.name' "${WORK}/target-release.json" | sort -u > "${TARGET_ASSET_NAMES}"
-                  else
-                    echo "::warning::无法读取目标附件列表，为避免误覆盖，本 Release 附件全部跳过。"
-                    ASSET_SKIPPED=${#ASSETS[@]}
-                    ASSETS=()
-                  fi
-                fi
-
+                gh api "repos/${TARGET_REPO}/releases/tags/${tag}" > "${WORK}/target-release.json" || true
+                jq -r '.assets[]?.name' "${WORK}/target-release.json" 2>/dev/null | sort -u > "${WORK}/target-assets.txt"
                 for asset_path in "${ASSETS[@]}"; do
                   asset_name="$(basename "${asset_path}")"
-
-                  if [ "${RELEASE_UPDATE_MODE}" = keep_existing_assets ] && grep -Fxq "${asset_name}" "${TARGET_ASSET_NAMES}"; then
+                  if [ "${RELEASE_UPDATE_MODE}" = keep_existing_assets ] && grep -Fxq "${asset_name}" "${WORK}/target-assets.txt"; then
                     echo "目标已有同名附件，保留并跳过：${asset_name}"
-                    ASSET_SKIPPED=$((ASSET_SKIPPED+1))
                     continue
                   fi
-
-                  UPLOAD_OK=false
-                  for upload_round in 1 2 3 4; do
-                    if gh release upload "${tag}" --repo "${TARGET_REPO}" "${asset_path}" > "${WORK}/upload.log" 2>&1; then
-                      UPLOAD_OK=true
-                      ASSET_UPLOADED=$((ASSET_UPLOADED+1))
-                      break
+                  if ! gh release upload "${tag}" --repo "${TARGET_REPO}" "${asset_path}"; then
+                    if [ "${RELEASE_UPDATE_MODE}" = keep_existing_assets ]; then
+                      echo "::warning::附件上传冲突，保留目标附件并跳过：${asset_name}"
+                    else
+                      ASSET_FAILURES=$((ASSET_FAILURES+1))
                     fi
-                    cat "${WORK}/upload.log"
-                    if [ "${RELEASE_UPDATE_MODE}" = keep_existing_assets ] && grep -q 'asset under the same name already exists' "${WORK}/upload.log"; then
-                      echo "附件索引显示同名附件已存在，保留并按跳过处理：${asset_name}"
-                      UPLOAD_OK=skipped
-                      ASSET_SKIPPED=$((ASSET_SKIPPED+1))
-                      break
-                    fi
-                    sleep $((upload_round*4))
-                  done
-
-                  if [ "${UPLOAD_OK}" = false ]; then
-                    echo "${tag}/${asset_name}" >> "${FAILED_FILE}"
-                    ASSET_FAILURES=$((ASSET_FAILURES+1))
                   fi
                 done
-
-                echo "Release ${tag} 附件统计：上传 ${ASSET_UPLOADED}，跳过 ${ASSET_SKIPPED}，失败 ${ASSET_FAILURES}"
               fi
-
-              if [ "${ASSET_FAILURES}" -eq 0 ]; then
-                OK=$((OK+1))
-              else
-                FAIL=$((FAIL+1))
-              fi
+              if [ "${ASSET_FAILURES}" -eq 0 ]; then OK=$((OK+1)); else FAIL=$((FAIL+1)); fi
             else
               echo "${tag}" >> "${FAILED_FILE}"
               FAIL=$((FAIL+1))
