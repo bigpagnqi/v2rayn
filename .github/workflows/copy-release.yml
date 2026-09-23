@@ -522,23 +522,10 @@ jobs:
             echo "创建清理快照：${tag}"
             echo "=========================================="
 
-            FORCE_UPDATE=false
             if git ls-remote --exit-code --tags --refs "${TARGET_URL}" "refs/tags/${tag}" >/dev/null 2>&1; then
-              EXISTING_REPO="$(mktemp -d)"
-              git -C "${EXISTING_REPO}" init -q
-              git -C "${EXISTING_REPO}" fetch --quiet --depth 1 "${TARGET_URL}" "refs/tags/${tag}:refs/tags/existing-${tag}"
-              EXISTING_COMMIT="$(git -C "${EXISTING_REPO}" rev-list -n 1 "refs/tags/existing-${tag}")"
-              EXISTING_SUBJECT="$(git -C "${EXISTING_REPO}" show -s --format='%s' "${EXISTING_COMMIT}")"
-              rm -rf "${EXISTING_REPO}"
-
-              if [[ "${EXISTING_SUBJECT}" == Clean\ snapshot\ of* ]]; then
-                echo "检测到旧 Clean snapshot Tag，将自动重建：${tag}"
-                FORCE_UPDATE=true
-              else
-                echo "目标 Tag 已存在且不是旧 Clean snapshot，安全跳过：${tag}"
-                SKIP=$((SKIP+1))
-                continue
-              fi
+              echo "目标 Tag 已存在，跳过：${tag}"
+              SKIP=$((SKIP+1))
+              continue
             fi
 
             SNAPSHOT="$(mktemp -d)"
@@ -573,37 +560,13 @@ jobs:
             git -C "${REPO}" add -A
             TREE_ID="$(git -C "${REPO}" write-tree)"
 
-            git -C "${CONTROL}" fetch --force --depth 1 upstream "refs/tags/${tag}:refs/tags/source-${tag}"
-            SOURCE_COMMIT="$(git -C "${CONTROL}" rev-list -n 1 "refs/tags/source-${tag}")"
-            SOURCE_AUTHOR_NAME="$(git -C "${CONTROL}" show -s --format='%an' "${SOURCE_COMMIT}")"
-            SOURCE_AUTHOR_EMAIL="$(git -C "${CONTROL}" show -s --format='%ae' "${SOURCE_COMMIT}")"
-            SOURCE_AUTHOR_DATE="$(git -C "${CONTROL}" show -s --format='%aI' "${SOURCE_COMMIT}")"
-            SOURCE_COMMITTER_NAME="$(git -C "${CONTROL}" show -s --format='%cn' "${SOURCE_COMMIT}")"
-            SOURCE_COMMITTER_EMAIL="$(git -C "${CONTROL}" show -s --format='%ce' "${SOURCE_COMMIT}")"
-            SOURCE_COMMITTER_DATE="$(git -C "${CONTROL}" show -s --format='%cI' "${SOURCE_COMMIT}")"
-            git -C "${CONTROL}" show -s --format='%B' "${SOURCE_COMMIT}" > "${REPO}/source-commit-message.txt"
-
-            COMMIT_ID="$(
-              GIT_AUTHOR_NAME="${SOURCE_AUTHOR_NAME}" \
-              GIT_AUTHOR_EMAIL="${SOURCE_AUTHOR_EMAIL}" \
-              GIT_AUTHOR_DATE="${SOURCE_AUTHOR_DATE}" \
-              GIT_COMMITTER_NAME="${SOURCE_COMMITTER_NAME}" \
-              GIT_COMMITTER_EMAIL="${SOURCE_COMMITTER_EMAIL}" \
-              GIT_COMMITTER_DATE="${SOURCE_COMMITTER_DATE}" \
-              git -C "${REPO}" commit-tree "${TREE_ID}" < "${REPO}/source-commit-message.txt"
-            )"
-            rm -f "${REPO}/source-commit-message.txt"
+            COMMIT_ID="$(printf 'Clean snapshot of %s from %s\n\nRemoved paths: %s\n' "${tag}" "${SOURCE_REPO}" "${REMOVE_PATHS}" | git -C "${REPO}" commit-tree "${TREE_ID}")"
             git -C "${REPO}" update-ref "refs/tags/${tag}" "${COMMIT_ID}"
 
             echo "新根提交：${COMMIT_ID}"
             echo "该提交没有上游父提交，因此不会把作者 workflow 历史带入目标 Tag。"
 
-            PUSH_ARGS=("${TARGET_URL}" "refs/tags/${tag}:refs/tags/${tag}")
-            if [ "${FORCE_UPDATE}" = true ]; then
-              PUSH_ARGS=(--force "${PUSH_ARGS[@]}")
-            fi
-
-            if git -C "${REPO}" push "${PUSH_ARGS[@]}"; then
+            if git -C "${REPO}" push "${TARGET_URL}" "refs/tags/${tag}:refs/tags/${tag}"; then
               OK=$((OK+1))
             else
               echo "::warning::推送清理 Tag 失败：${tag}"
@@ -622,7 +585,7 @@ jobs:
     if: ${{ inputs.run_copy_release }}
     runs-on: ubuntu-24.04
     env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_TOKEN: ${{ secrets.WORKFLOW_PAT || secrets.GITHUB_TOKEN }}
       SOURCE_REPO: ${{ needs.prepare.outputs.src_repo }}
       TARGET_REPO: ${{ needs.prepare.outputs.target_repo }}
       SELECTED_JSON: ${{ needs.prepare.outputs.selected_json }}
@@ -654,7 +617,48 @@ jobs:
             DRAFT="$(jq -r .isDraft "${WORK}/info.json")"
             PRE="$(jq -r .isPrerelease "${WORK}/info.json")"
             gh release download "${tag}" --repo "${SOURCE_REPO}" --dir "${WORK}/assets" || true
+
+            TARGET_RELEASE_EXISTS=false
             if gh release view "${tag}" --repo "${TARGET_REPO}" >/dev/null 2>&1; then
+              TARGET_RELEASE_EXISTS=true
+            fi
+
+            # 覆盖模式：删除并重建目标 Release，彻底清除幽灵附件名称索引。
+            # 不覆盖模式：保留目标 Release 和已有附件，后续只上传缺少的附件。
+            if [ "${TARGET_RELEASE_EXISTS}" = true ] && [ "${OVERWRITE_ASSETS}" = true ]; then
+              echo "已启用附件覆盖，删除目标 Release 后完整重建：${tag}"
+              DELETE_LOG="${WORK}/delete-release.log"
+
+              if ! gh release delete "${tag}" --repo "${TARGET_REPO}" --yes > "${DELETE_LOG}" 2>&1; then
+                echo "::error::删除目标 Release 失败：${tag}"
+                cat "${DELETE_LOG}"
+                echo "${tag}" >> "${FAILED_FILE}"
+                FAIL=$((FAIL+1))
+                rm -rf "${WORK}"
+                continue
+              fi
+
+              TARGET_RELEASE_EXISTS=false
+              DELETE_CONFIRMED=false
+              for wait_round in 1 2 3 4 5 6; do
+                if ! gh release view "${tag}" --repo "${TARGET_REPO}" >/dev/null 2>&1; then
+                  DELETE_CONFIRMED=true
+                  break
+                fi
+                echo "等待目标 Release 删除生效，第 ${wait_round}/6 次检查..."
+                sleep 3
+              done
+
+              if [ "${DELETE_CONFIRMED}" != true ]; then
+                echo "::error::目标 Release 删除后仍可查询到，停止重建：${tag}"
+                echo "${tag}" >> "${FAILED_FILE}"
+                FAIL=$((FAIL+1))
+                rm -rf "${WORK}"
+                continue
+              fi
+            fi
+
+            if [ "${TARGET_RELEASE_EXISTS}" = true ]; then
               ARGS=(release edit "${tag}" --repo "${TARGET_REPO}" --title "${TITLE}" --notes-file "${WORK}/body.md" --draft="${DRAFT}" --prerelease="${PRE}")
             else
               ARGS=(release create "${tag}" --repo "${TARGET_REPO}" --title "${TITLE}" --notes-file "${WORK}/body.md")
@@ -662,93 +666,77 @@ jobs:
               [ "${DRAFT}" = true ] && ARGS+=(--draft)
               [ "${PRE}" = true ] && ARGS+=(--prerelease)
             fi
+
             if gh "${ARGS[@]}"; then
               mapfile -d '' ASSETS < <(find "${WORK}/assets" -maxdepth 1 -type f -print0)
               ASSET_FAILURES=0
+              ASSET_SKIPPED=0
+              ASSET_UPLOADED=0
 
-              if [ "${#ASSETS[@]}" -gt 0 ]; then
-                ASSET_FAILED_FILE="${WORK}/failed-assets.txt"
-                : > "${ASSET_FAILED_FILE}"
+              # 不覆盖模式下，先读取目标附件名称。若同名附件已存在，直接跳过。
+              TARGET_ASSET_NAMES="${WORK}/target-asset-names.txt"
+              : > "${TARGET_ASSET_NAMES}"
 
-                for asset_path in "${ASSETS[@]}"; do
-                  asset_name="$(basename "${asset_path}")"
-                  echo "处理附件：${asset_name}"
-
-                  if [ "${OVERWRITE_ASSETS}" = true ]; then
-                    TARGET_RELEASE_JSON="${WORK}/target-release.json"
-
-                    if gh api                       -H 'Accept: application/vnd.github+json'                       "repos/${TARGET_REPO}/releases/tags/${tag}"                       > "${TARGET_RELEASE_JSON}"; then
-                      mapfile -t OLD_ASSET_IDS < <(
-                        jq -r                           --arg name "${asset_name}"                           '.assets[]? | select(.name == $name) | .id'                           "${TARGET_RELEASE_JSON}"
-                      )
-
-                      for old_asset_id in "${OLD_ASSET_IDS[@]}"; do
-                        [ -n "${old_asset_id}" ] || continue
-                        echo "删除目标同名附件：${asset_name}，ID=${old_asset_id}"
-
-                        DELETE_OUTPUT="${WORK}/delete-asset-${old_asset_id}.txt"
-                        DELETE_STATUS="$(
-                          gh api                             --method DELETE                             -H 'Accept: application/vnd.github+json'                             "repos/${TARGET_REPO}/releases/assets/${old_asset_id}"                             > "${DELETE_OUTPUT}" 2>&1 &&
-                          echo 0 || echo $?
-                        )"
-
-                        if [ "${DELETE_STATUS}" != 0 ]; then
-                          if grep -qE 'HTTP 404|Not Found' "${DELETE_OUTPUT}"; then
-                            echo "同名附件已经不存在，忽略 404 并继续：${asset_name}"
-                          else
-                            echo "::warning::删除旧附件失败，将继续尝试上传：${asset_name}"
-                            cat "${DELETE_OUTPUT}"
-                          fi
-                        fi
-                      done
-                    else
-                      echo "::warning::无法读取目标 Release 附件列表，将直接尝试上传：${tag}"
-                    fi
-                  fi
-
-                  if gh release upload                     "${tag}"                     --repo "${TARGET_REPO}"                     "${asset_path}"; then
-                    echo "附件上传成功：${asset_name}"
-                    continue
-                  fi
-
-                  echo "::warning::首次上传失败，重新查询并清理同名附件后重试：${asset_name}"
-                  RETRY_RELEASE_JSON="${WORK}/retry-release.json"
-
-                  if gh api                     -H 'Accept: application/vnd.github+json'                     "repos/${TARGET_REPO}/releases/tags/${tag}"                     > "${RETRY_RELEASE_JSON}"; then
-                    mapfile -t RETRY_ASSET_IDS < <(
-                      jq -r                         --arg name "${asset_name}"                         '.assets[]? | select(.name == $name) | .id'                         "${RETRY_RELEASE_JSON}"
-                    )
-
-                    for retry_asset_id in "${RETRY_ASSET_IDS[@]}"; do
-                      [ -n "${retry_asset_id}" ] || continue
-                      RETRY_DELETE_OUTPUT="${WORK}/retry-delete-${retry_asset_id}.txt"
-
-                      if ! gh api                         --method DELETE                         -H 'Accept: application/vnd.github+json'                         "repos/${TARGET_REPO}/releases/assets/${retry_asset_id}"                         > "${RETRY_DELETE_OUTPUT}" 2>&1; then
-                        if grep -qE 'HTTP 404|Not Found' "${RETRY_DELETE_OUTPUT}"; then
-                          echo "重试删除时附件已不存在，忽略 404：${asset_name}"
-                        else
-                          echo "::warning::重试删除旧附件失败：${asset_name}"
-                          cat "${RETRY_DELETE_OUTPUT}"
-                        fi
-                      fi
-                    done
-                  fi
-
-                  if gh release upload                     "${tag}"                     --repo "${TARGET_REPO}"                     "${asset_path}"; then
-                    echo "附件重试上传成功：${asset_name}"
-                  else
-                    echo "::error::附件重试上传仍然失败：${tag}/${asset_name}"
-                    printf '%s/%s\n' "${tag}" "${asset_name}" >> "${ASSET_FAILED_FILE}"
-                    ASSET_FAILURES=$((ASSET_FAILURES+1))
-                  fi
-                done
+              if [ "${OVERWRITE_ASSETS}" != true ]; then
+                TARGET_RELEASE_JSON="${WORK}/target-release.json"
+                if gh api                   -H 'Accept: application/vnd.github+json'                   "repos/${TARGET_REPO}/releases/tags/${tag}"                   > "${TARGET_RELEASE_JSON}"; then
+                  jq -r '.assets[]?.name' "${TARGET_RELEASE_JSON}" | sort -u > "${TARGET_ASSET_NAMES}"
+                else
+                  echo "::warning::无法读取目标附件列表。为避免误覆盖，跳过本 Release 的附件上传：${tag}"
+                  ASSET_SKIPPED=$((ASSET_SKIPPED+${#ASSETS[@]}))
+                  ASSETS=()
+                fi
               fi
+
+              for asset_path in "${ASSETS[@]}"; do
+                asset_name="$(basename "${asset_path}")"
+                echo "处理附件：${asset_name}"
+
+                if [ "${OVERWRITE_ASSETS}" != true ] && grep -Fxq "${asset_name}" "${TARGET_ASSET_NAMES}"; then
+                  echo "目标已有同名附件，未启用覆盖，直接跳过：${asset_name}"
+                  ASSET_SKIPPED=$((ASSET_SKIPPED+1))
+                  continue
+                fi
+
+                UPLOAD_LOG="${WORK}/upload-${asset_name}.log"
+                UPLOAD_OK=false
+
+                for upload_round in 1 2 3 4; do
+                  if gh release upload "${tag}" --repo "${TARGET_REPO}" "${asset_path}" > "${UPLOAD_LOG}" 2>&1; then
+                    echo "附件上传成功：${asset_name}"
+                    UPLOAD_OK=true
+                    ASSET_UPLOADED=$((ASSET_UPLOADED+1))
+                    break
+                  fi
+
+                  echo "附件上传失败，第 ${upload_round}/4 次：${asset_name}"
+                  cat "${UPLOAD_LOG}"
+
+                  # 未启用覆盖时绝不删除目标附件。若 GitHub 报同名冲突，则按跳过处理。
+                  if [ "${OVERWRITE_ASSETS}" != true ] && grep -q 'asset under the same name already exists' "${UPLOAD_LOG}"; then
+                    echo "目标附件索引显示同名附件已存在，未启用覆盖，按跳过处理：${asset_name}"
+                    ASSET_SKIPPED=$((ASSET_SKIPPED+1))
+                    UPLOAD_OK=skipped
+                    break
+                  fi
+
+                  echo "等待 GitHub 附件索引同步后重试..."
+                  sleep $((upload_round*4))
+                done
+
+                if [ "${UPLOAD_OK}" = false ]; then
+                  echo "::error::附件多次重试仍然失败：${tag}/${asset_name}"
+                  printf '%s/%s\n' "${tag}" "${asset_name}" >> "${FAILED_FILE}"
+                  ASSET_FAILURES=$((ASSET_FAILURES+1))
+                fi
+              done
+
+              echo "Release ${tag} 附件统计：上传 ${ASSET_UPLOADED}，跳过 ${ASSET_SKIPPED}，失败 ${ASSET_FAILURES}"
 
               if [ "${ASSET_FAILURES}" -eq 0 ]; then
                 OK=$((OK+1))
               else
-                echo "::warning::Release ${tag} 有 ${ASSET_FAILURES} 个附件同步失败，继续处理后续版本。"
-                cat "${ASSET_FAILED_FILE}" >> "${FAILED_FILE}"
+                echo "::warning::Release ${tag} 有 ${ASSET_FAILURES} 个附件失败，继续处理后续版本。"
                 FAIL=$((FAIL+1))
               fi
             else
