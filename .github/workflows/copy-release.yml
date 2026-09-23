@@ -190,9 +190,7 @@ jobs:
       selected_json: ${{ steps.final.outputs.selected_json }}
       selected_count: ${{ steps.final.outputs.selected_count }}
     env:
-      GH_TOKEN: ${{ secrets.WORKFLOW_PAT || secrets.GITHUB_TOKEN }}
-      API_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      API_WORKFLOW_PAT: ${{ secrets.WORKFLOW_PAT }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       INPUT_SRC_REPO: ${{ inputs.src_repo }}
       TARGET_REPO: ${{ github.repository }}
       COPY_MODE: ${{ inputs.copy_mode }}
@@ -259,11 +257,8 @@ jobs:
           git --version
           jq --version
           curl --version
-
-          echo "检查源仓库 Git 访问，不读取 README..."
-          git ls-remote --exit-code "https://github.com/${SOURCE_REPO}.git" HEAD >/dev/null
-          echo "检查目标仓库 Git 访问，不读取 README..."
-          git ls-remote --exit-code "https://github.com/${TARGET_REPO}.git" HEAD >/dev/null
+          gh repo view "${SOURCE_REPO}" >/dev/null
+          gh repo view "${TARGET_REPO}" >/dev/null
 
       - name: 获取并筛选 Release 版本
         id: select
@@ -278,8 +273,7 @@ jobs:
           REQUESTED="${RUNNER_TEMP}/requested-tags.txt"
 
           gh release list --repo "${SOURCE_REPO}" --limit 1000 --order asc \
-            --json tagName,name,publishedAt,createdAt,isDraft,isPrerelease |
-            jq 'sort_by([(.publishedAt // .createdAt), .tagName])' > "${ALL}"
+            --json tagName,name,publishedAt,createdAt,isDraft,isPrerelease > "${ALL}"
 
           TOTAL="$(jq length "${ALL}")"
           [ "${TOTAL}" -gt 0 ] || { echo "::error::源仓库没有 Release"; exit 1; }
@@ -384,7 +378,6 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       TOKEN: ${{ secrets.WORKFLOW_PAT }}
-      GH_TOKEN: ${{ secrets.WORKFLOW_PAT }}
       SOURCE_REPO: ${{ needs.prepare.outputs.src_repo }}
       TARGET_REPO: ${{ needs.prepare.outputs.target_repo }}
       SELECTED_JSON: ${{ needs.prepare.outputs.selected_json }}
@@ -493,7 +486,6 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      GH_TOKEN: ${{ secrets.WORKFLOW_PAT || secrets.GITHUB_TOKEN }}
       SOURCE_REPO: ${{ needs.prepare.outputs.src_repo }}
       TARGET_REPO: ${{ needs.prepare.outputs.target_repo }}
       SELECTED_JSON: ${{ needs.prepare.outputs.selected_json }}
@@ -540,8 +532,7 @@ jobs:
               rm -rf "${EXISTING_REPO}"
 
               if [[ "${EXISTING_SUBJECT}" == Clean\ snapshot\ of* ]]; then
-                echo "检测到旧 Clean snapshot Tag，将使用原作者提交信息重建：${tag}"
-                echo "旧提交标题：${EXISTING_SUBJECT}"
+                echo "检测到旧 Clean snapshot Tag，将自动重建：${tag}"
                 FORCE_UPDATE=true
               else
                 echo "目标 Tag 已存在且不是旧 Clean snapshot，安全跳过：${tag}"
@@ -673,13 +664,93 @@ jobs:
             fi
             if gh "${ARGS[@]}"; then
               mapfile -d '' ASSETS < <(find "${WORK}/assets" -maxdepth 1 -type f -print0)
+              ASSET_FAILURES=0
+
               if [ "${#ASSETS[@]}" -gt 0 ]; then
-                UPLOAD=(release upload "${tag}" --repo "${TARGET_REPO}")
-                [ "${OVERWRITE_ASSETS}" = true ] && UPLOAD+=(--clobber)
-                UPLOAD+=("${ASSETS[@]}")
-                gh "${UPLOAD[@]}"
+                ASSET_FAILED_FILE="${WORK}/failed-assets.txt"
+                : > "${ASSET_FAILED_FILE}"
+
+                for asset_path in "${ASSETS[@]}"; do
+                  asset_name="$(basename "${asset_path}")"
+                  echo "处理附件：${asset_name}"
+
+                  if [ "${OVERWRITE_ASSETS}" = true ]; then
+                    TARGET_RELEASE_JSON="${WORK}/target-release.json"
+
+                    if gh api                       -H 'Accept: application/vnd.github+json'                       "repos/${TARGET_REPO}/releases/tags/${tag}"                       > "${TARGET_RELEASE_JSON}"; then
+                      mapfile -t OLD_ASSET_IDS < <(
+                        jq -r                           --arg name "${asset_name}"                           '.assets[]? | select(.name == $name) | .id'                           "${TARGET_RELEASE_JSON}"
+                      )
+
+                      for old_asset_id in "${OLD_ASSET_IDS[@]}"; do
+                        [ -n "${old_asset_id}" ] || continue
+                        echo "删除目标同名附件：${asset_name}，ID=${old_asset_id}"
+
+                        DELETE_OUTPUT="${WORK}/delete-asset-${old_asset_id}.txt"
+                        DELETE_STATUS="$(
+                          gh api                             --method DELETE                             -H 'Accept: application/vnd.github+json'                             "repos/${TARGET_REPO}/releases/assets/${old_asset_id}"                             > "${DELETE_OUTPUT}" 2>&1 &&
+                          echo 0 || echo $?
+                        )"
+
+                        if [ "${DELETE_STATUS}" != 0 ]; then
+                          if grep -qE 'HTTP 404|Not Found' "${DELETE_OUTPUT}"; then
+                            echo "同名附件已经不存在，忽略 404 并继续：${asset_name}"
+                          else
+                            echo "::warning::删除旧附件失败，将继续尝试上传：${asset_name}"
+                            cat "${DELETE_OUTPUT}"
+                          fi
+                        fi
+                      done
+                    else
+                      echo "::warning::无法读取目标 Release 附件列表，将直接尝试上传：${tag}"
+                    fi
+                  fi
+
+                  if gh release upload                     "${tag}"                     --repo "${TARGET_REPO}"                     "${asset_path}"; then
+                    echo "附件上传成功：${asset_name}"
+                    continue
+                  fi
+
+                  echo "::warning::首次上传失败，重新查询并清理同名附件后重试：${asset_name}"
+                  RETRY_RELEASE_JSON="${WORK}/retry-release.json"
+
+                  if gh api                     -H 'Accept: application/vnd.github+json'                     "repos/${TARGET_REPO}/releases/tags/${tag}"                     > "${RETRY_RELEASE_JSON}"; then
+                    mapfile -t RETRY_ASSET_IDS < <(
+                      jq -r                         --arg name "${asset_name}"                         '.assets[]? | select(.name == $name) | .id'                         "${RETRY_RELEASE_JSON}"
+                    )
+
+                    for retry_asset_id in "${RETRY_ASSET_IDS[@]}"; do
+                      [ -n "${retry_asset_id}" ] || continue
+                      RETRY_DELETE_OUTPUT="${WORK}/retry-delete-${retry_asset_id}.txt"
+
+                      if ! gh api                         --method DELETE                         -H 'Accept: application/vnd.github+json'                         "repos/${TARGET_REPO}/releases/assets/${retry_asset_id}"                         > "${RETRY_DELETE_OUTPUT}" 2>&1; then
+                        if grep -qE 'HTTP 404|Not Found' "${RETRY_DELETE_OUTPUT}"; then
+                          echo "重试删除时附件已不存在，忽略 404：${asset_name}"
+                        else
+                          echo "::warning::重试删除旧附件失败：${asset_name}"
+                          cat "${RETRY_DELETE_OUTPUT}"
+                        fi
+                      fi
+                    done
+                  fi
+
+                  if gh release upload                     "${tag}"                     --repo "${TARGET_REPO}"                     "${asset_path}"; then
+                    echo "附件重试上传成功：${asset_name}"
+                  else
+                    echo "::error::附件重试上传仍然失败：${tag}/${asset_name}"
+                    printf '%s/%s\n' "${tag}" "${asset_name}" >> "${ASSET_FAILED_FILE}"
+                    ASSET_FAILURES=$((ASSET_FAILURES+1))
+                  fi
+                done
               fi
-              OK=$((OK+1))
+
+              if [ "${ASSET_FAILURES}" -eq 0 ]; then
+                OK=$((OK+1))
+              else
+                echo "::warning::Release ${tag} 有 ${ASSET_FAILURES} 个附件同步失败，继续处理后续版本。"
+                cat "${ASSET_FAILED_FILE}" >> "${FAILED_FILE}"
+                FAIL=$((FAIL+1))
+              fi
             else
               echo "${tag}" >> "${FAILED_FILE}"
               FAIL=$((FAIL+1))
