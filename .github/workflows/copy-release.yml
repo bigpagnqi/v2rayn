@@ -54,12 +54,6 @@ on:
         type: string
         default: ".github/workflows"
 
-      repair_legacy_clean_tags:
-        description: "自动修复提交名含 Clean snapshot of 的旧清理 Tag"
-        required: true
-        type: boolean
-        default: true
-
       run_copy_release:
         description: "搬运或更新 Release，独立运行"
         required: true
@@ -226,80 +220,6 @@ jobs:
           echo "Tag 同步方式：${{ inputs.tag_sync_mode }}"
           echo "搬运 Release：${{ inputs.run_copy_release }}"
           echo "搬运 Docker：${{ inputs.run_copy_docker }}"
-
-      - name: 显示 GitHub API 配额和重置时间
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          check_rate_limit() {
-            local token_name="$1"
-            local token_value="$2"
-            local body="${RUNNER_TEMP}/rate-${token_name}.json"
-            local headers="${RUNNER_TEMP}/rate-${token_name}.headers"
-            local status
-
-            if [ -z "${token_value}" ]; then
-              echo "令牌 ${token_name}：未配置"
-              return 0
-            fi
-
-            status="$(curl -sS --dump-header "${headers}" --output "${body}" --write-out '%{http_code}' \
-              -H "Authorization: Bearer ${token_value}" \
-              -H 'Accept: application/vnd.github+json' \
-              -H 'X-GitHub-Api-Version: 2022-11-28' \
-              https://api.github.com/rate_limit)"
-
-            echo "------------------------------------------"
-            echo "令牌：${token_name}"
-            echo "HTTP 状态：${status}"
-            if [ "${status}" != 200 ]; then
-              echo "无法读取配额：$(jq -r '.message // .' "${body}" 2>/dev/null || cat "${body}")"
-              return 0
-            fi
-
-            local limit used remaining reset_epoch reset_utc reset_local now wait_seconds wait_minutes resource
-            limit="$(jq -r '.resources.core.limit' "${body}")"
-            used="$(jq -r '.resources.core.used' "${body}")"
-            remaining="$(jq -r '.resources.core.remaining' "${body}")"
-            reset_epoch="$(jq -r '.resources.core.reset' "${body}")"
-            resource="$(grep -i '^x-ratelimit-resource:' "${headers}" | cut -d: -f2- | tr -d '\r' | xargs || true)"
-            reset_utc="$(date -u -d "@${reset_epoch}" '+%Y-%m-%d %H:%M:%S UTC')"
-            reset_local="$(TZ='America/Los_Angeles' date -d "@${reset_epoch}" '+%Y-%m-%d %H:%M:%S %Z')"
-            now="$(date +%s)"
-            wait_seconds=$((reset_epoch-now))
-            [ "${wait_seconds}" -ge 0 ] || wait_seconds=0
-            wait_minutes=$(((wait_seconds+59)/60))
-
-            echo "资源桶：${resource:-core}"
-            echo "总额度：${limit}"
-            echo "已使用：${used}"
-            echo "剩余：${remaining}"
-            echo "重置 Unix 时间：${reset_epoch}"
-            echo "重置时间 UTC：${reset_utc}"
-            echo "重置时间洛杉矶：${reset_local}"
-            echo "距离重置：${wait_seconds} 秒，约 ${wait_minutes} 分钟"
-
-            if [ "${remaining}" -eq 0 ]; then
-              echo "::warning title=${token_name} API 配额已耗尽::将在 ${reset_utc} 重置，约等待 ${wait_minutes} 分钟"
-            elif [ "${remaining}" -lt 50 ]; then
-              echo "::warning title=${token_name} API 配额较低::剩余 ${remaining}/${limit}，重置时间 ${reset_utc}"
-            fi
-
-            {
-              echo "### ${token_name} REST API 配额"
-              echo "- 总额度：${limit}"
-              echo "- 已使用：${used}"
-              echo "- 剩余：${remaining}"
-              echo "- 重置时间 UTC：${reset_utc}"
-              echo "- 重置时间洛杉矶：${reset_local}"
-              echo "- 距离重置：约 ${wait_minutes} 分钟"
-              echo
-            } >> "${GITHUB_STEP_SUMMARY}"
-          }
-
-          check_rate_limit "GITHUB_TOKEN" "${API_GITHUB_TOKEN}"
-          check_rate_limit "WORKFLOW_PAT" "${API_WORKFLOW_PAT}"
 
       - name: 自动识别源仓库
         id: repository
@@ -528,32 +448,12 @@ jobs:
           git -C "${WORK}" remote add upstream "${SOURCE_URL}"
 
           if [ "${{ inputs.sync_scope }}" = selected ]; then
-            printf '%s' "${SELECTED_JSON}" | jq -r '.[].tagName' | awk '!seen[$0]++' > "${WORK}/candidates"
+            printf '%s' "${SELECTED_JSON}"|jq -r '.[].tagName'|sort -u > "${WORK}/candidates"
           else
-            SOURCE_TAGS="${WORK}/source-tags.txt"
-            TARGET_TAGS="${WORK}/target-tags.txt"
-            MISSING_TAGS="${WORK}/missing-tags.txt"
-            RELEASE_ORDER="${WORK}/release-order.txt"
-            RELEASE_TAG_SET="${WORK}/release-tag-set.txt"
-            NON_RELEASE_MISSING="${WORK}/non-release-missing.txt"
-
-            git ls-remote --tags --refs "${SOURCE_URL}" | awk '{sub("refs/tags/", "", $2); print $2}' | sort -u > "${SOURCE_TAGS}"
-            git ls-remote --tags --refs "${TARGET_URL}" | awk '{sub("refs/tags/", "", $2); print $2}' | sort -u > "${TARGET_TAGS}"
-            comm -23 "${SOURCE_TAGS}" "${TARGET_TAGS}" > "${MISSING_TAGS}"
-
-            gh release list --repo "${SOURCE_REPO}" --limit 1000 --order asc \
-              --json tagName,publishedAt,createdAt \
-              --jq 'sort_by([(.publishedAt // .createdAt), .tagName]) | .[].tagName' |
-              awk '!seen[$0]++' > "${RELEASE_ORDER}"
-
-            sort -u "${RELEASE_ORDER}" > "${RELEASE_TAG_SET}"
-            awk 'NR==FNR {missing[$0]=1; next} ($0 in missing) {print $0}' "${MISSING_TAGS}" "${RELEASE_ORDER}" > "${WORK}/candidates"
-            comm -23 "${MISSING_TAGS}" "${RELEASE_TAG_SET}" > "${NON_RELEASE_MISSING}"
-            sort -V "${NON_RELEASE_MISSING}" >> "${WORK}/candidates"
+            git ls-remote --tags --refs "${SOURCE_URL}"|awk '{sub("refs/tags/","",$2);print $2}'|sort -u > "${WORK}/source"
+            git ls-remote --tags --refs "${TARGET_URL}"|awk '{sub("refs/tags/","",$2);print $2}'|sort -u > "${WORK}/target"
+            comm -23 "${WORK}/source" "${WORK}/target" > "${WORK}/candidates"
           fi
-
-          echo "Tag 处理顺序："
-          nl -ba "${WORK}/candidates"
 
           OK=0
           SKIP=0
@@ -598,7 +498,6 @@ jobs:
       TARGET_REPO: ${{ needs.prepare.outputs.target_repo }}
       SELECTED_JSON: ${{ needs.prepare.outputs.selected_json }}
       REMOVE_PATHS: ${{ inputs.clean_remove_paths }}
-      REPAIR_LEGACY: ${{ inputs.repair_legacy_clean_tags }}
     steps:
       - name: 创建不含指定路径的新根提交并推送同名 Tag
         shell: bash
@@ -615,42 +514,12 @@ jobs:
           git -C "${CONTROL}" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           if [ "${{ inputs.sync_scope }}" = selected ]; then
-            printf '%s' "${SELECTED_JSON}" | jq -r '.[].tagName' | awk '!seen[$0]++' > "${CONTROL}/candidates"
+            printf '%s' "${SELECTED_JSON}"|jq -r '.[].tagName'|sort -u > "${CONTROL}/candidates"
           else
-            SOURCE_TAGS="${CONTROL}/source-tags.txt"
-            TARGET_TAGS="${CONTROL}/target-tags.txt"
-            MISSING_TAGS="${CONTROL}/missing-tags.txt"
-            RELEASE_ORDER="${CONTROL}/release-order.txt"
-            RELEASE_TAG_SET="${CONTROL}/release-tag-set.txt"
-            NON_RELEASE_MISSING="${CONTROL}/non-release-missing.txt"
-
-            git ls-remote --tags --refs "${SOURCE_URL}" | awk '{sub("refs/tags/", "", $2); print $2}' | sort -u > "${SOURCE_TAGS}"
-            git ls-remote --tags --refs "${TARGET_URL}" | awk '{sub("refs/tags/", "", $2); print $2}' | sort -u > "${TARGET_TAGS}"
-            comm -23 "${SOURCE_TAGS}" "${TARGET_TAGS}" > "${MISSING_TAGS}"
-
-            gh release list --repo "${SOURCE_REPO}" --limit 1000 --order asc \
-              --json tagName,publishedAt,createdAt \
-              --jq 'sort_by([(.publishedAt // .createdAt), .tagName]) | .[].tagName' |
-              awk '!seen[$0]++' > "${RELEASE_ORDER}"
-
-            sort -u "${RELEASE_ORDER}" > "${RELEASE_TAG_SET}"
-            awk 'NR==FNR {missing[$0]=1; next} ($0 in missing) {print $0}' "${MISSING_TAGS}" "${RELEASE_ORDER}" > "${CONTROL}/candidates"
-            comm -23 "${MISSING_TAGS}" "${RELEASE_TAG_SET}" > "${NON_RELEASE_MISSING}"
-            sort -V "${NON_RELEASE_MISSING}" >> "${CONTROL}/candidates"
+            git ls-remote --tags --refs "${SOURCE_URL}"|awk '{sub("refs/tags/","",$2);print $2}'|sort -u > "${CONTROL}/source"
+            git ls-remote --tags --refs "${TARGET_URL}"|awk '{sub("refs/tags/","",$2);print $2}'|sort -u > "${CONTROL}/target"
+            comm -23 "${CONTROL}/source" "${CONTROL}/target" > "${CONTROL}/candidates"
           fi
-
-          # all_missing 默认只包含缺失 Tag。启用旧清理 Tag 修复时，
-          # 还要把已有 Release Tag 加入检查列表，才能发现并覆盖旧的 Clean snapshot 提交。
-          if [ "${{ inputs.sync_scope }}" != selected ] && [ "${REPAIR_LEGACY}" = true ]; then
-            {
-              cat "${CONTROL}/candidates"
-              cat "${RELEASE_ORDER}"
-            } | awk '!seen[$0]++' > "${CONTROL}/candidates-with-repair"
-            mv "${CONTROL}/candidates-with-repair" "${CONTROL}/candidates"
-          fi
-
-          echo "Tag 处理顺序："
-          nl -ba "${CONTROL}/candidates"
 
           OK=0
           SKIP=0
@@ -663,25 +532,19 @@ jobs:
 
             FORCE_UPDATE=false
             if git ls-remote --exit-code --tags --refs "${TARGET_URL}" "refs/tags/${tag}" >/dev/null 2>&1; then
-              if [ "${REPAIR_LEGACY}" = true ]; then
-                EXISTING_REPO="$(mktemp -d)"
-                git -C "${EXISTING_REPO}" init -q
-                git -C "${EXISTING_REPO}" fetch --quiet --depth 1 "${TARGET_URL}" "refs/tags/${tag}:refs/tags/existing-${tag}"
-                EXISTING_COMMIT="$(git -C "${EXISTING_REPO}" rev-list -n 1 "refs/tags/existing-${tag}")"
-                EXISTING_SUBJECT="$(git -C "${EXISTING_REPO}" show -s --format='%s' "${EXISTING_COMMIT}")"
-                rm -rf "${EXISTING_REPO}"
+              EXISTING_REPO="$(mktemp -d)"
+              git -C "${EXISTING_REPO}" init -q
+              git -C "${EXISTING_REPO}" fetch --quiet --depth 1 "${TARGET_URL}" "refs/tags/${tag}:refs/tags/existing-${tag}"
+              EXISTING_COMMIT="$(git -C "${EXISTING_REPO}" rev-list -n 1 "refs/tags/existing-${tag}")"
+              EXISTING_SUBJECT="$(git -C "${EXISTING_REPO}" show -s --format='%s' "${EXISTING_COMMIT}")"
+              rm -rf "${EXISTING_REPO}"
 
-                if [[ "${EXISTING_SUBJECT}" == Clean\ snapshot\ of* ]]; then
-                  echo "检测到旧清理 Tag，将重建并覆盖：${tag}"
-                  echo "旧提交标题：${EXISTING_SUBJECT}"
-                  FORCE_UPDATE=true
-                else
-                  echo "目标 Tag 已存在且不是旧 Clean snapshot，安全跳过：${tag}"
-                  SKIP=$((SKIP+1))
-                  continue
-                fi
+              if [[ "${EXISTING_SUBJECT}" == Clean\ snapshot\ of* ]]; then
+                echo "检测到旧 Clean snapshot Tag，将使用原作者提交信息重建：${tag}"
+                echo "旧提交标题：${EXISTING_SUBJECT}"
+                FORCE_UPDATE=true
               else
-                echo "目标 Tag 已存在，且未启用旧清理 Tag 修复，跳过：${tag}"
+                echo "目标 Tag 已存在且不是旧 Clean snapshot，安全跳过：${tag}"
                 SKIP=$((SKIP+1))
                 continue
               fi
