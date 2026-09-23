@@ -60,6 +60,16 @@ on:
         type: boolean
         default: false
 
+      release_update_mode:
+        description: "Release 更新方式：完整覆盖、保留已有附件、仅更新版本信息"
+        required: true
+        type: choice
+        default: keep_existing_assets
+        options:
+          - overwrite_all_assets
+          - keep_existing_assets
+          - metadata_only
+
       run_copy_docker:
         description: "直接搬运一个或多个 Docker 多架构镜像"
         required: true
@@ -134,12 +144,6 @@ on:
         required: false
         type: string
         default: ""
-
-      overwrite_assets:
-        description: "覆盖目标 Release 中的同名附件"
-        required: true
-        type: boolean
-        default: true
 
       include_drafts:
         description: "包含草稿 Release"
@@ -585,12 +589,12 @@ jobs:
     if: ${{ inputs.run_copy_release }}
     runs-on: ubuntu-24.04
     env:
-      GH_TOKEN: ${{ secrets.WORKFLOW_PAT || secrets.GITHUB_TOKEN }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       SOURCE_REPO: ${{ needs.prepare.outputs.src_repo }}
       TARGET_REPO: ${{ needs.prepare.outputs.target_repo }}
       SELECTED_JSON: ${{ needs.prepare.outputs.selected_json }}
       SELECTED_COUNT: ${{ needs.prepare.outputs.selected_count }}
-      OVERWRITE_ASSETS: ${{ inputs.overwrite_assets }}
+      RELEASE_UPDATE_MODE: ${{ inputs.release_update_mode }}
     steps:
       - name: 搬运标题、说明、状态和附件
         shell: bash
@@ -616,28 +620,27 @@ jobs:
             jq -r '.body//""' "${WORK}/info.json" > "${WORK}/body.md"
             DRAFT="$(jq -r .isDraft "${WORK}/info.json")"
             PRE="$(jq -r .isPrerelease "${WORK}/info.json")"
-            gh release download "${tag}" --repo "${SOURCE_REPO}" --dir "${WORK}/assets" || true
-
             TARGET_RELEASE_EXISTS=false
             if gh release view "${tag}" --repo "${TARGET_REPO}" >/dev/null 2>&1; then
               TARGET_RELEASE_EXISTS=true
             fi
 
-            # 覆盖模式：删除并重建目标 Release，彻底清除幽灵附件名称索引。
-            # 不覆盖模式：保留目标 Release 和已有附件，后续只上传缺少的附件。
-            if [ "${TARGET_RELEASE_EXISTS}" = true ] && [ "${OVERWRITE_ASSETS}" = true ]; then
-              echo "已启用附件覆盖，删除目标 Release 后完整重建：${tag}"
-              DELETE_LOG="${WORK}/delete-release.log"
+            # metadata_only 只更新 Release 版本信息，不下载、删除或上传任何附件。
+            if [ "${RELEASE_UPDATE_MODE}" = metadata_only ]; then
+              echo "仅更新版本信息，不处理附件：${tag}"
+            else
+              gh release download "${tag}" --repo "${SOURCE_REPO}" --dir "${WORK}/assets" || true
+            fi
 
-              if ! gh release delete "${tag}" --repo "${TARGET_REPO}" --yes > "${DELETE_LOG}" 2>&1; then
-                echo "::error::删除目标 Release 失败：${tag}"
-                cat "${DELETE_LOG}"
+            # 完整覆盖模式通过重建 Release 清除旧附件及幽灵附件索引，Git Tag 保持不变。
+            if [ "${TARGET_RELEASE_EXISTS}" = true ] && [ "${RELEASE_UPDATE_MODE}" = overwrite_all_assets ]; then
+              echo "完整覆盖附件，删除目标 Release 后重建：${tag}"
+              if ! gh release delete "${tag}" --repo "${TARGET_REPO}" --yes; then
                 echo "${tag}" >> "${FAILED_FILE}"
                 FAIL=$((FAIL+1))
                 rm -rf "${WORK}"
                 continue
               fi
-
               TARGET_RELEASE_EXISTS=false
               DELETE_CONFIRMED=false
               for wait_round in 1 2 3 4 5 6; do
@@ -648,9 +651,7 @@ jobs:
                 echo "等待目标 Release 删除生效，第 ${wait_round}/6 次检查..."
                 sleep 3
               done
-
               if [ "${DELETE_CONFIRMED}" != true ]; then
-                echo "::error::目标 Release 删除后仍可查询到，停止重建：${tag}"
                 echo "${tag}" >> "${FAILED_FILE}"
                 FAIL=$((FAIL+1))
                 rm -rf "${WORK}"
@@ -668,75 +669,65 @@ jobs:
             fi
 
             if gh "${ARGS[@]}"; then
-              mapfile -d '' ASSETS < <(find "${WORK}/assets" -maxdepth 1 -type f -print0)
               ASSET_FAILURES=0
               ASSET_SKIPPED=0
               ASSET_UPLOADED=0
 
-              # 不覆盖模式下，先读取目标附件名称。若同名附件已存在，直接跳过。
-              TARGET_ASSET_NAMES="${WORK}/target-asset-names.txt"
-              : > "${TARGET_ASSET_NAMES}"
+              if [ "${RELEASE_UPDATE_MODE}" = metadata_only ]; then
+                echo "Release ${tag} 已更新版本信息，附件未读取、未删除、未上传。"
+              else
+                mapfile -d '' ASSETS < <(find "${WORK}/assets" -maxdepth 1 -type f -print0)
+                TARGET_ASSET_NAMES="${WORK}/target-asset-names.txt"
+                : > "${TARGET_ASSET_NAMES}"
 
-              if [ "${OVERWRITE_ASSETS}" != true ]; then
-                TARGET_RELEASE_JSON="${WORK}/target-release.json"
-                if gh api                   -H 'Accept: application/vnd.github+json'                   "repos/${TARGET_REPO}/releases/tags/${tag}"                   > "${TARGET_RELEASE_JSON}"; then
-                  jq -r '.assets[]?.name' "${TARGET_RELEASE_JSON}" | sort -u > "${TARGET_ASSET_NAMES}"
-                else
-                  echo "::warning::无法读取目标附件列表。为避免误覆盖，跳过本 Release 的附件上传：${tag}"
-                  ASSET_SKIPPED=$((ASSET_SKIPPED+${#ASSETS[@]}))
-                  ASSETS=()
-                fi
-              fi
-
-              for asset_path in "${ASSETS[@]}"; do
-                asset_name="$(basename "${asset_path}")"
-                echo "处理附件：${asset_name}"
-
-                if [ "${OVERWRITE_ASSETS}" != true ] && grep -Fxq "${asset_name}" "${TARGET_ASSET_NAMES}"; then
-                  echo "目标已有同名附件，未启用覆盖，直接跳过：${asset_name}"
-                  ASSET_SKIPPED=$((ASSET_SKIPPED+1))
-                  continue
-                fi
-
-                UPLOAD_LOG="${WORK}/upload-${asset_name}.log"
-                UPLOAD_OK=false
-
-                for upload_round in 1 2 3 4; do
-                  if gh release upload "${tag}" --repo "${TARGET_REPO}" "${asset_path}" > "${UPLOAD_LOG}" 2>&1; then
-                    echo "附件上传成功：${asset_name}"
-                    UPLOAD_OK=true
-                    ASSET_UPLOADED=$((ASSET_UPLOADED+1))
-                    break
+                if [ "${RELEASE_UPDATE_MODE}" = keep_existing_assets ]; then
+                  if gh api "repos/${TARGET_REPO}/releases/tags/${tag}" > "${WORK}/target-release.json"; then
+                    jq -r '.assets[]?.name' "${WORK}/target-release.json" | sort -u > "${TARGET_ASSET_NAMES}"
+                  else
+                    echo "::warning::无法读取目标附件列表，为避免误覆盖，本 Release 附件全部跳过。"
+                    ASSET_SKIPPED=${#ASSETS[@]}
+                    ASSETS=()
                   fi
+                fi
 
-                  echo "附件上传失败，第 ${upload_round}/4 次：${asset_name}"
-                  cat "${UPLOAD_LOG}"
+                for asset_path in "${ASSETS[@]}"; do
+                  asset_name="$(basename "${asset_path}")"
 
-                  # 未启用覆盖时绝不删除目标附件。若 GitHub 报同名冲突，则按跳过处理。
-                  if [ "${OVERWRITE_ASSETS}" != true ] && grep -q 'asset under the same name already exists' "${UPLOAD_LOG}"; then
-                    echo "目标附件索引显示同名附件已存在，未启用覆盖，按跳过处理：${asset_name}"
+                  if [ "${RELEASE_UPDATE_MODE}" = keep_existing_assets ] && grep -Fxq "${asset_name}" "${TARGET_ASSET_NAMES}"; then
+                    echo "目标已有同名附件，保留并跳过：${asset_name}"
                     ASSET_SKIPPED=$((ASSET_SKIPPED+1))
-                    UPLOAD_OK=skipped
-                    break
+                    continue
                   fi
 
-                  echo "等待 GitHub 附件索引同步后重试..."
-                  sleep $((upload_round*4))
+                  UPLOAD_OK=false
+                  for upload_round in 1 2 3 4; do
+                    if gh release upload "${tag}" --repo "${TARGET_REPO}" "${asset_path}" > "${WORK}/upload.log" 2>&1; then
+                      UPLOAD_OK=true
+                      ASSET_UPLOADED=$((ASSET_UPLOADED+1))
+                      break
+                    fi
+                    cat "${WORK}/upload.log"
+                    if [ "${RELEASE_UPDATE_MODE}" = keep_existing_assets ] && grep -q 'asset under the same name already exists' "${WORK}/upload.log"; then
+                      echo "附件索引显示同名附件已存在，保留并按跳过处理：${asset_name}"
+                      UPLOAD_OK=skipped
+                      ASSET_SKIPPED=$((ASSET_SKIPPED+1))
+                      break
+                    fi
+                    sleep $((upload_round*4))
+                  done
+
+                  if [ "${UPLOAD_OK}" = false ]; then
+                    echo "${tag}/${asset_name}" >> "${FAILED_FILE}"
+                    ASSET_FAILURES=$((ASSET_FAILURES+1))
+                  fi
                 done
 
-                if [ "${UPLOAD_OK}" = false ]; then
-                  echo "::error::附件多次重试仍然失败：${tag}/${asset_name}"
-                  printf '%s/%s\n' "${tag}" "${asset_name}" >> "${FAILED_FILE}"
-                  ASSET_FAILURES=$((ASSET_FAILURES+1))
-                fi
-              done
-
-              echo "Release ${tag} 附件统计：上传 ${ASSET_UPLOADED}，跳过 ${ASSET_SKIPPED}，失败 ${ASSET_FAILURES}"
+                echo "Release ${tag} 附件统计：上传 ${ASSET_UPLOADED}，跳过 ${ASSET_SKIPPED}，失败 ${ASSET_FAILURES}"
+              fi
 
               if [ "${ASSET_FAILURES}" -eq 0 ]; then
                 OK=$((OK+1))
               else
-                echo "::warning::Release ${tag} 有 ${ASSET_FAILURES} 个附件失败，继续处理后续版本。"
                 FAIL=$((FAIL+1))
               fi
             else
