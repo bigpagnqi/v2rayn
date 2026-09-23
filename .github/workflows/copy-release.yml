@@ -190,7 +190,9 @@ jobs:
       selected_json: ${{ steps.final.outputs.selected_json }}
       selected_count: ${{ steps.final.outputs.selected_count }}
     env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_TOKEN: ${{ secrets.WORKFLOW_PAT || secrets.GITHUB_TOKEN }}
+      API_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      API_WORKFLOW_PAT: ${{ secrets.WORKFLOW_PAT }}
       INPUT_SRC_REPO: ${{ inputs.src_repo }}
       TARGET_REPO: ${{ github.repository }}
       COPY_MODE: ${{ inputs.copy_mode }}
@@ -218,6 +220,112 @@ jobs:
           echo "Tag 同步方式：${{ inputs.tag_sync_mode }}"
           echo "搬运 Release：${{ inputs.run_copy_release }}"
           echo "搬运 Docker：${{ inputs.run_copy_docker }}"
+
+      - name: 显示 GitHub API 配额和重置时间
+        id: api_rate_limit
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          check_rate_limit() {
+            local token_name="$1"
+            local token_value="$2"
+            local response_file="${RUNNER_TEMP}/rate-limit-${token_name}.json"
+            local header_file="${RUNNER_TEMP}/rate-limit-${token_name}.headers"
+            local http_status
+
+            if [ -z "${token_value}" ]; then
+              echo "------------------------------------------"
+              echo "令牌：${token_name}"
+              echo "状态：未配置"
+              return 0
+            fi
+
+            http_status="$(
+              curl -sS                 --dump-header "${header_file}"                 --output "${response_file}"                 --write-out '%{http_code}'                 -H "Authorization: Bearer ${token_value}"                 -H 'Accept: application/vnd.github+json'                 -H 'X-GitHub-Api-Version: 2022-11-28'                 'https://api.github.com/rate_limit'
+            )"
+
+            echo "------------------------------------------"
+            echo "令牌：${token_name}"
+            echo "HTTP 状态：${http_status}"
+
+            if [ "${http_status}" != "200" ]; then
+              echo "状态：无法读取配额"
+              if [ -s "${response_file}" ]; then
+                echo "GitHub 返回："
+                jq -r '.message // .' "${response_file}" 2>/dev/null || cat "${response_file}"
+              fi
+              return 0
+            fi
+
+            local limit
+            local used
+            local remaining
+            local reset_epoch
+            local reset_utc
+            local reset_los_angeles
+            local now_epoch
+            local wait_seconds
+            local wait_minutes
+            local resource
+
+            limit="$(jq -r '.resources.core.limit' "${response_file}")"
+            used="$(jq -r '.resources.core.used' "${response_file}")"
+            remaining="$(jq -r '.resources.core.remaining' "${response_file}")"
+            reset_epoch="$(jq -r '.resources.core.reset' "${response_file}")"
+            resource="$(grep -i '^x-ratelimit-resource:' "${header_file}" | cut -d: -f2- | tr -d '\r' | xargs || true)"
+
+            reset_utc="$(date -u -d "@${reset_epoch}" '+%Y-%m-%d %H:%M:%S UTC')"
+            reset_los_angeles="$(TZ='America/Los_Angeles' date -d "@${reset_epoch}" '+%Y-%m-%d %H:%M:%S %Z')"
+            now_epoch="$(date +%s)"
+            wait_seconds=$((reset_epoch - now_epoch))
+            [ "${wait_seconds}" -ge 0 ] || wait_seconds=0
+            wait_minutes=$(((wait_seconds + 59) / 60))
+
+            echo "资源桶：${resource:-core}"
+            echo "总额度：${limit}"
+            echo "已使用：${used}"
+            echo "剩余：${remaining}"
+            echo "重置 Unix 时间：${reset_epoch}"
+            echo "重置时间 UTC：${reset_utc}"
+            echo "重置时间洛杉矶：${reset_los_angeles}"
+            echo "距离重置：${wait_seconds} 秒，约 ${wait_minutes} 分钟"
+
+            if [ "${remaining}" -eq 0 ]; then
+              echo "::warning title=${token_name} API 配额已耗尽::将在 ${reset_utc} 重置，约等待 ${wait_minutes} 分钟"
+            elif [ "${remaining}" -lt 50 ]; then
+              echo "::warning title=${token_name} API 配额较低::仅剩 ${remaining}/${limit}，重置时间 ${reset_utc}"
+            else
+              echo "状态：配额可用"
+            fi
+
+            {
+              echo "### ${token_name} REST API 配额"
+              echo ""
+              echo "- 资源桶：${resource:-core}"
+              echo "- 总额度：${limit}"
+              echo "- 已使用：${used}"
+              echo "- 剩余：${remaining}"
+              echo "- 重置时间 UTC：${reset_utc}"
+              echo "- 重置时间洛杉矶：${reset_los_angeles}"
+              echo "- 距离重置：约 ${wait_minutes} 分钟"
+              echo ""
+            } >> "${GITHUB_STEP_SUMMARY}"
+          }
+
+          echo "=========================================="
+          echo "GitHub REST API 配额检查"
+          echo "=========================================="
+
+          check_rate_limit "GITHUB_TOKEN" "${API_GITHUB_TOKEN}"
+          check_rate_limit "WORKFLOW_PAT" "${API_WORKFLOW_PAT}"
+
+          echo "------------------------------------------"
+          if [ -n "${API_WORKFLOW_PAT}" ]; then
+            echo "本次 GitHub CLI/API 读取优先使用：WORKFLOW_PAT"
+          else
+            echo "本次 GitHub CLI/API 读取使用：GITHUB_TOKEN"
+          fi
 
       - name: 自动识别源仓库
         id: repository
@@ -257,8 +365,14 @@ jobs:
           git --version
           jq --version
           curl --version
-          gh repo view "${SOURCE_REPO}" >/dev/null
-          gh repo view "${TARGET_REPO}" >/dev/null
+
+          echo "检查源仓库 Git 访问，不读取 README、不额外消耗 REST API 配额..."
+          git ls-remote --exit-code "https://github.com/${SOURCE_REPO}.git" HEAD >/dev/null
+
+          echo "检查目标仓库 Git 访问，不读取 README、不额外消耗 REST API 配额..."
+          git ls-remote --exit-code "https://github.com/${TARGET_REPO}.git" HEAD >/dev/null
+
+          echo "仓库 Git 访问检查通过。"
 
       - name: 获取并筛选 Release 版本
         id: select
@@ -272,8 +386,11 @@ jobs:
           OUT="${RUNNER_TEMP}/selected-releases.json"
           REQUESTED="${RUNNER_TEMP}/requested-tags.txt"
 
+          echo "读取 Release 时优先使用 WORKFLOW_PAT；未配置时才回退到 GITHUB_TOKEN。"
+          # 按原作者发布时间从旧到新排序；时间相同时按 Tag 名稳定排序。
           gh release list --repo "${SOURCE_REPO}" --limit 1000 --order asc \
-            --json tagName,name,publishedAt,createdAt,isDraft,isPrerelease > "${ALL}"
+            --json tagName,name,publishedAt,createdAt,isDraft,isPrerelease |
+            jq 'sort_by([(.publishedAt // .createdAt), .tagName])' > "${ALL}"
 
           TOTAL="$(jq length "${ALL}")"
           [ "${TOTAL}" -gt 0 ] || { echo "::error::源仓库没有 Release"; exit 1; }
@@ -441,12 +558,38 @@ jobs:
           git -C "${WORK}" remote add upstream "${SOURCE_URL}"
 
           if [ "${{ inputs.sync_scope }}" = selected ]; then
-            printf '%s' "${SELECTED_JSON}"|jq -r '.[].tagName'|sort -u > "${WORK}/candidates"
+            # SELECTED_JSON 已按原作者 Release 发布时间排列；去重但保持顺序。
+            printf '%s' "${SELECTED_JSON}" |
+              jq -r '.[].tagName' |
+              awk '!seen[$0]++' > "${WORK}/candidates"
           else
-            git ls-remote --tags --refs "${SOURCE_URL}"|awk '{sub("refs/tags/","",$2);print $2}'|sort -u > "${WORK}/source"
-            git ls-remote --tags --refs "${TARGET_URL}"|awk '{sub("refs/tags/","",$2);print $2}'|sort -u > "${WORK}/target"
-            comm -23 "${WORK}/source" "${WORK}/target" > "${WORK}/candidates"
+            SOURCE_TAGS="${WORK}/source-tags.txt"
+            TARGET_TAGS="${WORK}/target-tags.txt"
+            MISSING_TAGS="${WORK}/missing-tags.txt"
+            RELEASE_ORDER="${WORK}/release-order.txt"
+            RELEASE_TAG_SET="${WORK}/release-tag-set.txt"
+            NON_RELEASE_MISSING="${WORK}/non-release-missing.txt"
+
+            git ls-remote --tags --refs "${SOURCE_URL}" |
+              awk '{sub("refs/tags/", "", $2); print $2}' | sort -u > "${SOURCE_TAGS}"
+            git ls-remote --tags --refs "${TARGET_URL}" |
+              awk '{sub("refs/tags/", "", $2); print $2}' | sort -u > "${TARGET_TAGS}"
+            comm -23 "${SOURCE_TAGS}" "${TARGET_TAGS}" > "${MISSING_TAGS}"
+
+            gh release list --repo "${SOURCE_REPO}" --limit 1000 --order asc \
+              --json tagName,publishedAt,createdAt \
+              --jq 'sort_by([(.publishedAt // .createdAt), .tagName]) | .[].tagName' |
+              awk '!seen[$0]++' > "${RELEASE_ORDER}"
+
+            sort -u "${RELEASE_ORDER}" > "${RELEASE_TAG_SET}"
+            awk 'NR==FNR {missing[$0]=1; next} ($0 in missing) {print $0}' \
+              "${MISSING_TAGS}" "${RELEASE_ORDER}" > "${WORK}/candidates"
+            comm -23 "${MISSING_TAGS}" "${RELEASE_TAG_SET}" > "${NON_RELEASE_MISSING}"
+            sort -V "${NON_RELEASE_MISSING}" >> "${WORK}/candidates"
           fi
+
+          echo "原始 Tag 处理顺序："
+          nl -ba "${WORK}/candidates"
 
           OK=0
           SKIP=0
@@ -506,12 +649,38 @@ jobs:
           git -C "${CONTROL}" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           if [ "${{ inputs.sync_scope }}" = selected ]; then
-            printf '%s' "${SELECTED_JSON}"|jq -r '.[].tagName'|sort -u > "${CONTROL}/candidates"
+            # SELECTED_JSON 已按原作者 Release 发布时间排列；去重但保持顺序。
+            printf '%s' "${SELECTED_JSON}" |
+              jq -r '.[].tagName' |
+              awk '!seen[$0]++' > "${CONTROL}/candidates"
           else
-            git ls-remote --tags --refs "${SOURCE_URL}"|awk '{sub("refs/tags/","",$2);print $2}'|sort -u > "${CONTROL}/source"
-            git ls-remote --tags --refs "${TARGET_URL}"|awk '{sub("refs/tags/","",$2);print $2}'|sort -u > "${CONTROL}/target"
-            comm -23 "${CONTROL}/source" "${CONTROL}/target" > "${CONTROL}/candidates"
+            SOURCE_TAGS="${CONTROL}/source-tags.txt"
+            TARGET_TAGS="${CONTROL}/target-tags.txt"
+            MISSING_TAGS="${CONTROL}/missing-tags.txt"
+            RELEASE_ORDER="${CONTROL}/release-order.txt"
+            RELEASE_TAG_SET="${CONTROL}/release-tag-set.txt"
+            NON_RELEASE_MISSING="${CONTROL}/non-release-missing.txt"
+
+            git ls-remote --tags --refs "${SOURCE_URL}" |
+              awk '{sub("refs/tags/", "", $2); print $2}' | sort -u > "${SOURCE_TAGS}"
+            git ls-remote --tags --refs "${TARGET_URL}" |
+              awk '{sub("refs/tags/", "", $2); print $2}' | sort -u > "${TARGET_TAGS}"
+            comm -23 "${SOURCE_TAGS}" "${TARGET_TAGS}" > "${MISSING_TAGS}"
+
+            gh release list --repo "${SOURCE_REPO}" --limit 1000 --order asc \
+              --json tagName,publishedAt,createdAt \
+              --jq 'sort_by([(.publishedAt // .createdAt), .tagName]) | .[].tagName' |
+              awk '!seen[$0]++' > "${RELEASE_ORDER}"
+
+            sort -u "${RELEASE_ORDER}" > "${RELEASE_TAG_SET}"
+            awk 'NR==FNR {missing[$0]=1; next} ($0 in missing) {print $0}' \
+              "${MISSING_TAGS}" "${RELEASE_ORDER}" > "${CONTROL}/candidates"
+            comm -23 "${MISSING_TAGS}" "${RELEASE_TAG_SET}" > "${NON_RELEASE_MISSING}"
+            sort -V "${NON_RELEASE_MISSING}" >> "${CONTROL}/candidates"
           fi
+
+          echo "清理快照 Tag 处理顺序："
+          nl -ba "${CONTROL}/candidates"
 
           OK=0
           SKIP=0
@@ -560,7 +729,28 @@ jobs:
             git -C "${REPO}" add -A
             TREE_ID="$(git -C "${REPO}" write-tree)"
 
-            COMMIT_ID="$(printf 'Clean snapshot of %s from %s\n\nRemoved paths: %s\n' "${tag}" "${SOURCE_REPO}" "${REMOVE_PATHS}" | git -C "${REPO}" commit-tree "${TREE_ID}")"
+            # 复用上游 Tag 对应提交的原始标题、完整说明、作者、提交者和时间。
+            # 新提交仍然没有父提交，因此不会带入作者 workflow 历史。
+            git -C "${CONTROL}" fetch --force --depth 1 upstream "refs/tags/${tag}:refs/tags/source-${tag}"
+            SOURCE_COMMIT="$(git -C "${CONTROL}" rev-list -n 1 "refs/tags/source-${tag}")"
+            SOURCE_AUTHOR_NAME="$(git -C "${CONTROL}" show -s --format='%an' "${SOURCE_COMMIT}")"
+            SOURCE_AUTHOR_EMAIL="$(git -C "${CONTROL}" show -s --format='%ae' "${SOURCE_COMMIT}")"
+            SOURCE_AUTHOR_DATE="$(git -C "${CONTROL}" show -s --format='%aI' "${SOURCE_COMMIT}")"
+            SOURCE_COMMITTER_NAME="$(git -C "${CONTROL}" show -s --format='%cn' "${SOURCE_COMMIT}")"
+            SOURCE_COMMITTER_EMAIL="$(git -C "${CONTROL}" show -s --format='%ce' "${SOURCE_COMMIT}")"
+            SOURCE_COMMITTER_DATE="$(git -C "${CONTROL}" show -s --format='%cI' "${SOURCE_COMMIT}")"
+            git -C "${CONTROL}" show -s --format='%B' "${SOURCE_COMMIT}" > "${REPO}/source-commit-message.txt"
+
+            COMMIT_ID="$(
+              GIT_AUTHOR_NAME="${SOURCE_AUTHOR_NAME}" \
+              GIT_AUTHOR_EMAIL="${SOURCE_AUTHOR_EMAIL}" \
+              GIT_AUTHOR_DATE="${SOURCE_AUTHOR_DATE}" \
+              GIT_COMMITTER_NAME="${SOURCE_COMMITTER_NAME}" \
+              GIT_COMMITTER_EMAIL="${SOURCE_COMMITTER_EMAIL}" \
+              GIT_COMMITTER_DATE="${SOURCE_COMMITTER_DATE}" \
+              git -C "${REPO}" commit-tree "${TREE_ID}" < "${REPO}/source-commit-message.txt"
+            )"
+            rm -f "${REPO}/source-commit-message.txt"
             git -C "${REPO}" update-ref "refs/tags/${tag}" "${COMMIT_ID}"
 
             echo "新根提交：${COMMIT_ID}"
